@@ -26,6 +26,7 @@ RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 TASK_NAME = "BootRunner Startup"
 DEFAULT_CONFIG: dict[str, Any] = {
     "programs": [],
+    "start_time": "00:00",
     "cutoff_time": "18:30",
     "startup_delay": 10,
     "check_workday": True,
@@ -51,11 +52,16 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         programs = []
     programs = [str(item) for item in programs if isinstance(item, str) and item.strip()]
 
-    cutoff = str(config.get("cutoff_time", DEFAULT_CONFIG["cutoff_time"]))
-    try:
-        dt.datetime.strptime(cutoff, "%H:%M")
-    except ValueError:
-        cutoff = DEFAULT_CONFIG["cutoff_time"]
+    def valid_time(key: str) -> str:
+        value = str(config.get(key, DEFAULT_CONFIG[key]))
+        try:
+            dt.datetime.strptime(value, "%H:%M")
+            return value
+        except ValueError:
+            return DEFAULT_CONFIG[key]
+
+    start_time = valid_time("start_time")
+    cutoff = valid_time("cutoff_time")
 
     try:
         delay = min(600, max(0, int(config.get("startup_delay", 10))))
@@ -64,6 +70,7 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "programs": programs,
+        "start_time": start_time,
         "cutoff_time": cutoff,
         "startup_delay": delay,
         "check_workday": bool(config.get("check_workday", True)),
@@ -120,12 +127,19 @@ def should_run(
 ) -> bool:
     config = validate_config(config)
     now = now or dt.datetime.now()
+    start = dt.datetime.strptime(config["start_time"], "%H:%M").time()
     cutoff = dt.datetime.strptime(config["cutoff_time"], "%H:%M").time()
     logger = log or get_logger()
     logger.info("开始检查，当前时间 %s", now.strftime("%Y-%m-%d %H:%M:%S"))
 
-    if now.time() > cutoff:
-        logger.info("已超过最晚启动时间 %s，不启动", config["cutoff_time"])
+    current = now.time()
+    in_window = start <= current <= cutoff if start <= cutoff else current >= start or current <= cutoff
+    if not in_window:
+        logger.info(
+            "当前时间不在启动窗口 %s-%s，不启动",
+            config["start_time"],
+            config["cutoff_time"],
+        )
         return False
     if not config["check_workday"]:
         logger.info("未启用工作日检查，允许启动")
@@ -367,15 +381,15 @@ class BootRunnerApp:
 
         options = ttk.LabelFrame(tab, text="执行规则", padding=12)
         options.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(18, 12))
-        ttk.Label(options, text="最晚启动时间").grid(row=0, column=0, sticky="w")
-        hour, minute = self.config["cutoff_time"].split(":")
-        self.hour = self.tk.StringVar(value=hour)
-        self.minute = self.tk.StringVar(value=minute)
-        ttk.Spinbox(options, from_=0, to=23, width=4, textvariable=self.hour, format="%02.0f").grid(
+        ttk.Label(options, text="开始时间").grid(row=0, column=0, sticky="w")
+        start_hour, start_minute = self.config["start_time"].split(":")
+        self.start_hour = self.tk.StringVar(value=start_hour)
+        self.start_minute = self.tk.StringVar(value=start_minute)
+        ttk.Spinbox(options, from_=0, to=23, width=4, textvariable=self.start_hour, format="%02.0f").grid(
             row=0, column=1, padx=(10, 2)
         )
         ttk.Label(options, text=":").grid(row=0, column=2)
-        ttk.Spinbox(options, from_=0, to=59, width=4, textvariable=self.minute, format="%02.0f").grid(
+        ttk.Spinbox(options, from_=0, to=59, width=4, textvariable=self.start_minute, format="%02.0f").grid(
             row=0, column=3, padx=(2, 20)
         )
         ttk.Label(options, text="开机后等待（秒）").grid(row=0, column=4, sticky="w")
@@ -384,24 +398,36 @@ class BootRunnerApp:
             row=0, column=5, padx=(10, 0)
         )
 
+        ttk.Label(options, text="结束时间").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        end_hour, end_minute = self.config["cutoff_time"].split(":")
+        self.end_hour = self.tk.StringVar(value=end_hour)
+        self.end_minute = self.tk.StringVar(value=end_minute)
+        ttk.Spinbox(options, from_=0, to=23, width=4, textvariable=self.end_hour, format="%02.0f").grid(
+            row=1, column=1, padx=(10, 2), pady=(8, 0)
+        )
+        ttk.Label(options, text=":").grid(row=1, column=2, pady=(8, 0))
+        ttk.Spinbox(options, from_=0, to=59, width=4, textvariable=self.end_minute, format="%02.0f").grid(
+            row=1, column=3, padx=(2, 20), pady=(8, 0)
+        )
+
         self.check_workday = self.tk.BooleanVar(value=self.config["check_workday"])
         self.run_offline = self.tk.BooleanVar(value=self.config["run_when_offline"])
         self.autostart = self.tk.BooleanVar(value=is_system_autostart_enabled())
         ttk.Checkbutton(options, text="仅工作日和调休工作日启动", variable=self.check_workday).grid(
-            row=1, column=0, columnspan=4, sticky="w", pady=(12, 0)
+            row=2, column=0, columnspan=4, sticky="w", pady=(12, 0)
         )
         ttk.Checkbutton(options, text="节假日服务不可用时仍启动", variable=self.run_offline).grid(
-            row=2, column=0, columnspan=4, sticky="w", pady=(6, 0)
+            row=3, column=0, columnspan=4, sticky="w", pady=(6, 0)
         )
         ttk.Checkbutton(options, text="系统启动时执行（登录前，需管理员授权）", variable=self.autostart).grid(
-            row=3, column=0, columnspan=4, sticky="w", pady=(6, 0)
+            row=4, column=0, columnspan=4, sticky="w", pady=(6, 0)
         )
         ttk.Label(
             options,
             text="注意：普通桌面程序在登录前位于 Session 0，不会显示界面；远程软件需自身支持系统服务模式。",
             style="Hint.TLabel",
             wraplength=620,
-        ).grid(row=4, column=0, columnspan=6, sticky="w", pady=(8, 0))
+        ).grid(row=5, column=0, columnspan=6, sticky="w", pady=(8, 0))
 
         actions = ttk.Frame(tab)
         actions.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(8, 0))
@@ -455,16 +481,25 @@ class BootRunnerApp:
 
     def _collect_config(self) -> dict[str, Any]:
         try:
-            hour = int(self.hour.get())
-            minute = int(self.minute.get())
+            start_hour = int(self.start_hour.get())
+            start_minute = int(self.start_minute.get())
+            end_hour = int(self.end_hour.get())
+            end_minute = int(self.end_minute.get())
             delay = int(self.delay.get())
         except ValueError as error:
             raise ValueError("时间和等待秒数必须是数字") from error
-        if not (0 <= hour <= 23 and 0 <= minute <= 59 and 0 <= delay <= 600):
+        times_valid = (
+            0 <= start_hour <= 23
+            and 0 <= start_minute <= 59
+            and 0 <= end_hour <= 23
+            and 0 <= end_minute <= 59
+        )
+        if not times_valid or not 0 <= delay <= 600:
             raise ValueError("时间或等待秒数超出有效范围")
         return {
             "programs": list(self.program_list.get(0, "end")),
-            "cutoff_time": f"{hour:02d}:{minute:02d}",
+            "start_time": f"{start_hour:02d}:{start_minute:02d}",
+            "cutoff_time": f"{end_hour:02d}:{end_minute:02d}",
             "startup_delay": delay,
             "check_workday": self.check_workday.get(),
             "run_when_offline": self.run_offline.get(),
