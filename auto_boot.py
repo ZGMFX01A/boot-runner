@@ -170,6 +170,23 @@ def launch_programs(programs: list[str], log: logging.Logger | None = None) -> i
         if not path.is_file():
             logger.error("找不到程序：%s", path)
             continue
+        related_services = find_related_services(path) if is_system_account() else []
+        if related_services:
+            for service in related_services:
+                if start_windows_service(service, logger):
+                    launched += 1
+            logger.info(
+                "SYSTEM 模式下不启动桌面程序 %s，已改用配套服务：%s",
+                path,
+                ", ".join(related_services),
+            )
+            continue
+        if is_system_account():
+            logger.error(
+                "已跳过不具备配套服务的桌面程序：%s；桌面程序不能在登录前的 Session 0 中可靠运行",
+                path,
+            )
+            continue
         try:
             subprocess.Popen([str(path)], cwd=str(path.parent))
             logger.info("已启动：%s", path)
@@ -177,6 +194,64 @@ def launch_programs(programs: list[str], log: logging.Logger | None = None) -> i
         except OSError as error:
             logger.error("启动失败：%s；%s", path, error)
     return launched
+
+
+def is_system_account() -> bool:
+    return os.name == "nt" and os.environ.get("USERNAME", "").upper() == "SYSTEM"
+
+
+def find_related_services(program: Path) -> list[str]:
+    if os.name != "nt":
+        return []
+    import winreg
+
+    matches: list[str] = []
+    program_stem = program.stem.casefold()
+    try:
+        root = winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Services"
+        )
+    except OSError:
+        return []
+    with root:
+        index = 0
+        while True:
+            try:
+                service_name = winreg.EnumKey(root, index)
+                index += 1
+            except OSError:
+                break
+            try:
+                with winreg.OpenKey(root, service_name) as service_key:
+                    image_path = str(winreg.QueryValueEx(service_key, "ImagePath")[0])
+            except OSError:
+                continue
+            image_path = os.path.expandvars(image_path.strip())
+            if image_path.startswith('"'):
+                executable = image_path.split('"', 2)[1]
+            else:
+                executable = image_path.split(" ", 1)[0]
+            service_path = Path(executable.removeprefix("\\??\\"))
+            same_directory = str(service_path.parent).casefold() == str(program.parent).casefold()
+            related_name = (
+                program_stem in service_path.stem.casefold()
+                or service_path.stem.casefold() in program_stem
+            )
+            if same_directory and related_name:
+                matches.append(service_name)
+    return matches
+
+
+def start_windows_service(name: str, log: logging.Logger) -> bool:
+    result = subprocess.run(
+        ["sc.exe", "start", name], capture_output=True, text=True, errors="replace"
+    )
+    output = f"{result.stdout}\n{result.stderr}"
+    if result.returncode == 0 or "1056" in output:
+        log.info("Windows 服务已运行：%s", name)
+        return True
+    log.error("Windows 服务启动失败：%s；%s", name, output.strip())
+    return False
 
 
 def run_once(
@@ -226,11 +301,14 @@ def is_system_autostart_enabled() -> bool:
         return False
     result = subprocess.run(
         ["schtasks.exe", "/Query", "/TN", TASK_NAME],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        errors="replace",
         check=False,
     )
-    return result.returncode == 0
+    output = f"{result.stdout}\n{result.stderr}".casefold()
+    return result.returncode == 0 or "access is denied" in output or "拒绝访问" in output
 
 
 def set_system_autostart(
