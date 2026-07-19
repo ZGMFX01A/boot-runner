@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import ctypes
 import datetime as dt
 import json
 import logging
@@ -22,8 +23,14 @@ APP_NAME = "BootRunner"
 APP_DIR = Path(os.getenv("APPDATA", Path.home())) / APP_NAME
 CONFIG_FILE = APP_DIR / "config.json"
 LOG_FILE = APP_DIR / "boot-runner.log"
+HOLIDAY_CACHE_DIR = APP_DIR / "holidays"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 TASK_NAME = "BootRunner Startup"
+UI_RUN_VALUE = f"{APP_NAME} UI"
+HOLIDAY_DATA_URLS = (
+    "https://cdn.jsdelivr.net/gh/NateScarlet/holiday-cn@master/{year}.json",
+    "https://raw.githubusercontent.com/NateScarlet/holiday-cn/master/{year}.json",
+)
 DEFAULT_CONFIG: dict[str, Any] = {
     "programs": [],
     "start_time": "00:00",
@@ -102,21 +109,85 @@ def get_logger(path: Path = LOG_FILE) -> logging.Logger:
     return logger
 
 
-def fetch_day_type(date: dt.date, retries: int = 3, retry_delay: float = 2) -> tuple[int, str]:
-    url = f"https://timor.tech/api/holiday/info/{date.isoformat()}"
+def fetch_json(url: str, timeout: float = 5) -> Any:
     request = Request(url, headers={"User-Agent": f"{APP_NAME}/1.0"})
-    last_error: Exception | None = None
-    for attempt in range(retries):
+    with urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def fetch_timor_day_type(date: dt.date) -> tuple[int, str]:
+    url = f"https://timor.tech/api/holiday/info/{date.isoformat()}"
+    payload = fetch_json(url)
+    day = payload["type"]
+    return int(day["type"]), str(day["name"])
+
+
+def day_type_from_year_data(date: dt.date, payload: Any) -> tuple[int, str]:
+    if not isinstance(payload, dict) or payload.get("year") != date.year:
+        raise ValueError("年度节假日数据年份无效")
+    days = payload.get("days")
+    if not isinstance(days, list):
+        raise ValueError("年度节假日数据格式无效")
+    for item in days:
+        if isinstance(item, dict) and item.get("date") == date.isoformat():
+            name = str(item.get("name") or "调休")
+            return (2, name) if item.get("isOffDay") is True else (3, f"{name}调休")
+    if date.weekday() < 5:
+        return 0, "工作日"
+    return 1, "周六" if date.weekday() == 5 else "周日"
+
+
+def read_holiday_cache(date: dt.date, cache_dir: Path) -> Any | None:
+    path = cache_dir / f"{date.year}.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        day_type_from_year_data(date, payload)
+        return payload
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+
+
+def write_holiday_cache(year: int, payload: Any, cache_dir: Path) -> None:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    path = cache_dir / f"{year}.json"
+    target = path.with_suffix(".tmp")
+    target.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    target.replace(path)
+
+
+def fetch_day_type(
+    date: dt.date, cache_dir: Path = HOLIDAY_CACHE_DIR
+) -> tuple[int, str]:
+    errors: list[str] = []
+    cached = read_holiday_cache(date, cache_dir)
+    try:
+        result = fetch_timor_day_type(date)
+        if cached is None:
+            for template in HOLIDAY_DATA_URLS:
+                try:
+                    payload = fetch_json(template.format(year=date.year))
+                    day_type_from_year_data(date, payload)
+                    write_holiday_cache(date.year, payload, cache_dir)
+                    break
+                except (HTTPError, URLError, TimeoutError, OSError, ValueError, KeyError, TypeError):
+                    continue
+        return result
+    except (HTTPError, URLError, TimeoutError, OSError, ValueError, KeyError, TypeError) as error:
+        errors.append(f"timor.tech: {error}")
+
+    if cached is not None:
+        return day_type_from_year_data(date, cached)
+
+    for template in HOLIDAY_DATA_URLS:
+        url = template.format(year=date.year)
         try:
-            with urlopen(request, timeout=5) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-            day = payload["type"]
-            return int(day["type"]), str(day["name"])
+            payload = fetch_json(url)
+            result = day_type_from_year_data(date, payload)
+            write_holiday_cache(date.year, payload, cache_dir)
+            return result
         except (HTTPError, URLError, TimeoutError, OSError, ValueError, KeyError, TypeError) as error:
-            last_error = error
-            if attempt + 1 < retries:
-                time.sleep(retry_delay)
-    raise RuntimeError(f"节假日服务不可用: {last_error}")
+            errors.append(f"{url}: {error}")
+    raise RuntimeError("所有节假日数据源均不可用: " + "; ".join(errors))
 
 
 def should_run(
@@ -155,8 +226,12 @@ def should_run(
         return False
     except Exception as error:
         logger.warning("工作日查询失败：%s", error)
+        if now.weekday() >= 5:
+            weekday = "周六" if now.weekday() == 5 else "周日"
+            logger.info("接口不可用，本地日历显示今天是%s，不启动", weekday)
+            return False
         if config["run_when_offline"]:
-            logger.info("已启用断网兜底，允许启动")
+            logger.info("接口不可用，但本地日历为周一至周五；已启用断网兜底，允许启动")
             return True
         logger.info("未启用断网兜底，不启动")
         return False
@@ -170,7 +245,8 @@ def launch_programs(programs: list[str], log: logging.Logger | None = None) -> i
         if not path.is_file():
             logger.error("找不到程序：%s", path)
             continue
-        related_services = find_related_services(path) if is_system_account() else []
+        noninteractive = is_noninteractive_session()
+        related_services = find_related_services(path) if noninteractive else []
         if related_services:
             for service in related_services:
                 if start_windows_service(service, logger):
@@ -181,7 +257,7 @@ def launch_programs(programs: list[str], log: logging.Logger | None = None) -> i
                 ", ".join(related_services),
             )
             continue
-        if is_system_account():
+        if noninteractive:
             logger.error(
                 "已跳过不具备配套服务的桌面程序：%s；桌面程序不能在登录前的 Session 0 中可靠运行",
                 path,
@@ -196,8 +272,15 @@ def launch_programs(programs: list[str], log: logging.Logger | None = None) -> i
     return launched
 
 
-def is_system_account() -> bool:
-    return os.name == "nt" and os.environ.get("USERNAME", "").upper() == "SYSTEM"
+def is_noninteractive_session() -> bool:
+    if os.name != "nt":
+        return False
+    session_id = ctypes.c_ulong()
+    if ctypes.windll.kernel32.ProcessIdToSessionId(
+        os.getpid(), ctypes.byref(session_id)
+    ):
+        return session_id.value == 0
+    return os.environ.get("USERNAME", "").upper() == "SYSTEM"
 
 
 def find_related_services(program: Path) -> list[str]:
@@ -268,7 +351,9 @@ def run_once(
     if wait and config["startup_delay"]:
         logger.info("等待 %s 秒后检查", config["startup_delay"])
         time.sleep(config["startup_delay"])
-    if not should_run(config, log=logger):
+    holiday_cache = config_path.parent / "holidays"
+    provider = lambda date: fetch_day_type(date, holiday_cache)
+    if not should_run(config, day_type_provider=provider, log=logger):
         return 0
     return launch_programs(config["programs"], logger)
 
@@ -284,9 +369,24 @@ def autostart_command(
     return subprocess.list2cmdline(args)
 
 
-def remove_legacy_autostart() -> None:
+def user_ui_command(
+    config_path: Path = CONFIG_FILE, log_path: Path = LOG_FILE
+) -> str:
+    executable = Path(sys.executable)
+    if not getattr(sys, "frozen", False) and executable.name.casefold() == "python.exe":
+        pythonw = executable.with_name("pythonw.exe")
+        if pythonw.is_file():
+            executable = pythonw
+    args = [str(executable)]
+    if not getattr(sys, "frozen", False):
+        args.append(str(Path(__file__).resolve()))
+    args.extend(["--run-ui", "--config", str(config_path), "--log", str(log_path)])
+    return subprocess.list2cmdline(args)
+
+
+def set_user_ui_autostart(enabled: bool) -> None:
     if os.name != "nt":
-        return
+        raise OSError("用户登录自启仅支持 Windows")
     import winreg
 
     with winreg.CreateKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
@@ -294,6 +394,13 @@ def remove_legacy_autostart() -> None:
             winreg.DeleteValue(key, APP_NAME)
         except FileNotFoundError:
             pass
+        if enabled:
+            winreg.SetValueEx(key, UI_RUN_VALUE, 0, winreg.REG_SZ, user_ui_command())
+        else:
+            try:
+                winreg.DeleteValue(key, UI_RUN_VALUE)
+            except FileNotFoundError:
+                pass
 
 
 def is_system_autostart_enabled() -> bool:
@@ -338,7 +445,6 @@ def set_system_autostart(
     if result.returncode and not (not enabled and not is_system_autostart_enabled()):
         detail = result.stderr.strip() or result.stdout.strip() or f"错误码 {result.returncode}"
         raise OSError(f"计划任务操作失败：{detail}")
-    remove_legacy_autostart()
 
 
 def run_elevated_autostart_helper(enabled: bool) -> None:
@@ -494,10 +600,10 @@ class BootRunnerApp:
         ttk.Checkbutton(options, text="仅工作日和调休工作日启动", variable=self.check_workday).grid(
             row=2, column=0, columnspan=4, sticky="w", pady=(12, 0)
         )
-        ttk.Checkbutton(options, text="节假日服务不可用时仍启动", variable=self.run_offline).grid(
+        ttk.Checkbutton(options, text="接口不可用时，普通周一至周五仍启动", variable=self.run_offline).grid(
             row=3, column=0, columnspan=4, sticky="w", pady=(6, 0)
         )
-        ttk.Checkbutton(options, text="系统启动时执行（登录前，需管理员授权）", variable=self.autostart).grid(
+        ttk.Checkbutton(options, text="登录前启动服务，登录后显示软件托盘图标", variable=self.autostart).grid(
             row=4, column=0, columnspan=4, sticky="w", pady=(6, 0)
         )
         ttk.Label(
@@ -591,8 +697,8 @@ class BootRunnerApp:
             save_config(self.config)
             desired_autostart = self.autostart.get()
             if desired_autostart != is_system_autostart_enabled():
-                remove_legacy_autostart()
                 run_elevated_autostart_helper(desired_autostart)
+            set_user_ui_autostart(desired_autostart)
         except (OSError, ValueError) as error:
             messagebox.showerror("保存失败", str(error), parent=self.root)
             return False
@@ -658,6 +764,7 @@ class BootRunnerApp:
 def main() -> int:
     parser = argparse.ArgumentParser(description="按时间和工作日规则启动软件")
     parser.add_argument("--run", action="store_true", help="无界面执行一次")
+    parser.add_argument("--run-ui", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--config", type=Path, default=CONFIG_FILE, help=argparse.SUPPRESS)
     parser.add_argument("--log", type=Path, default=LOG_FILE, help=argparse.SUPPRESS)
     parser.add_argument(
@@ -673,6 +780,9 @@ def main() -> int:
         return 0
     if args.run:
         run_once(config_path=args.config, log_path=args.log)
+        return 0
+    if args.run_ui:
+        run_once(wait=False, config_path=args.config, log_path=args.log)
         return 0
     BootRunnerApp().run()
     return 0
