@@ -12,13 +12,13 @@ python auto_boot.py
 
 在界面中添加一个或多个软件，设置开始时间、结束时间和开机等待时间，勾选“登录前启动服务，登录后显示软件托盘图标”，然后保存。首次启用或关闭时 Windows 会显示 UAC 管理员授权提示；计划任务使用 `SYSTEM` 账户，开机时不要求输入用户密码。
 
-日志保存在：
+日志保存在程序同级目录（脚本所在目录或 `BootRunner.exe` 所在目录）：
 
 ```text
-%APPDATA%\BootRunner\boot-runner.log
+boot-runner.log
 ```
 
-日志单文件最大 2 MB，自动保留 3 个历史文件。配置保存在 `%APPDATA%\BootRunner\config.json`。
+日志单文件最大 2 MB，自动保留 3 个历史文件。配置与节假日缓存同样就地保存在程序同级目录下的 `config.json` 与 `holidays/`。
 
 也可以手动执行一次无界面检查：
 
@@ -26,14 +26,26 @@ python auto_boot.py
 python auto_boot.py --run
 ```
 
+## 打包为独立 EXE
+
+项目支持一键编译为无需 Python 环境的单文件无控制台 Windows 可执行程序：
+
+- **本地一键打包**：直接双击运行根目录下的 `build.bat`，或在命令行运行：
+  ```powershell
+  python build_exe.py
+  ```
+  生成的可执行文件位于 `dist/BootRunner.exe`。
+- **GitHub 自动构建**：项目配置了 GitHub Actions 工作流（`.github/workflows/build.yml`），推送到 `main` 分支会自动构建并提供 Artifact 下载；推送以 `v*` 开头的 Tag 时会自动发布 GitHub Release 并附带 EXE 二进制产物。
+
 ## 规则
 
 - 当前时间不在开始时间和结束时间构成的启动窗口内时不启动；支持 `22:00-06:00` 这样的跨午夜窗口。
 - 启用工作日检查时，普通工作日和调休工作日启动，周末和节假日不启动。
 - 节假日服务不可用时，本地日历为周六、周日则不启动；周一至周五是否启动由“断网兜底”选项决定。
-- 节假日判断依次使用 Timor 主接口、本地年度缓存、jsDelivr 和 GitHub Raw 年度数据；在线数据均不可用时才降级到本地星期。
+- 节假日判断优先使用本地年度缓存（避免开机弱网等待），本地无缓存时依次使用 Timor 主接口、jsDelivr 和 GitHub Raw 年度数据并持久化；在线数据均不可用时才降级到本地星期。
 - 登录前自启通过 Windows 计划任务 `BootRunner Startup` 实现，触发器为系统启动，运行账户为 `SYSTEM`。
 - 用户登录后通过当前用户的 `Run` 项再次检查规则，并在交互会话中启动软件 GUI，因此 GameViewer 等软件可以正常显示自己的托盘图标。
+- 桌面启动增加了运行中进程查重保护，避免软件重复多开。
 
 ## 登录前运行限制
 

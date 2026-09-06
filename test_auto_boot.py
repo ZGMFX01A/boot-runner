@@ -1,0 +1,308 @@
+import datetime as dt
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+import auto_boot
+
+
+class ConfigTests(unittest.TestCase):
+    def test_config_round_trip(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            config = {
+                "programs": [r"C:\Tools\demo.exe"],
+                "start_time": "07:30",
+                "cutoff_time": "09:05",
+                "startup_delay": 3,
+                "check_workday": False,
+                "run_when_offline": False,
+            }
+            auto_boot.save_config(config, path)
+            self.assertEqual(auto_boot.load_config(path), config)
+
+    def test_invalid_config_uses_safe_defaults(self):
+        config = auto_boot.validate_config(
+            {"start_time": "bad", "cutoff_time": "25:99", "startup_delay": -5}
+        )
+        self.assertEqual(config["start_time"], "00:00")
+        self.assertEqual(config["cutoff_time"], "18:30")
+        self.assertEqual(config["startup_delay"], 0)
+
+    def test_system_task_command_uses_explicit_user_paths(self):
+        command = auto_boot.autostart_command(
+            Path(r"C:\Users\demo\config.json"), Path(r"C:\Users\demo\runner.log")
+        )
+        self.assertIn("--config C:\\Users\\demo\\config.json", command)
+        self.assertIn("--log C:\\Users\\demo\\runner.log", command)
+
+    def test_user_ui_command_runs_after_login_with_pythonw(self):
+        command = auto_boot.user_ui_command(
+            Path(r"C:\Users\demo\config.json"), Path(r"C:\Users\demo\runner.log")
+        )
+        self.assertIn("pythonw.exe", command.casefold())
+        self.assertIn("--run-ui", command)
+
+    @patch("auto_boot.subprocess.run")
+    def test_system_task_runs_at_boot_as_system(self, run: Mock):
+        run.return_value = Mock(returncode=0, stdout="", stderr="")
+        auto_boot.set_system_autostart(True)
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("/SC") + 1], "ONSTART")
+        self.assertEqual(command[command.index("/RU") + 1], "SYSTEM")
+
+
+class SchedulingTests(unittest.TestCase):
+    def setUp(self):
+        self.config = auto_boot.DEFAULT_CONFIG | {"startup_delay": 0}
+        self.logger = auto_boot.logging.getLogger("test-boot-runner")
+        self.logger.addHandler(auto_boot.logging.NullHandler())
+
+    def test_after_cutoff_never_runs(self):
+        now = dt.datetime(2026, 7, 14, 18, 31)
+        self.assertFalse(auto_boot.should_run(self.config, now, log=self.logger))
+
+    def test_before_start_time_does_not_run(self):
+        config = self.config | {"start_time": "08:30"}
+        now = dt.datetime(2026, 7, 14, 8, 29)
+        self.assertFalse(auto_boot.should_run(config, now, log=self.logger))
+
+    def test_overnight_window_is_supported(self):
+        config = self.config | {
+            "start_time": "22:00",
+            "cutoff_time": "06:00",
+            "check_workday": False,
+        }
+        now = dt.datetime(2026, 7, 14, 23, 0)
+        self.assertTrue(auto_boot.should_run(config, now, log=self.logger))
+
+    def test_workday_runs_before_cutoff(self):
+        now = dt.datetime(2026, 7, 14, 9, 0)
+        provider = lambda _: (0, "工作日")
+        self.assertTrue(auto_boot.should_run(self.config, now, provider, self.logger))
+
+    def test_holiday_does_not_run(self):
+        now = dt.datetime(2026, 7, 14, 9, 0)
+        provider = lambda _: (2, "节日")
+        self.assertFalse(auto_boot.should_run(self.config, now, provider, self.logger))
+
+    def test_offline_policy_is_configurable(self):
+        now = dt.datetime(2026, 7, 14, 9, 0)
+
+        def unavailable(_):
+            raise RuntimeError("offline")
+
+        self.assertTrue(auto_boot.should_run(self.config, now, unavailable, self.logger))
+        config = self.config | {"run_when_offline": False}
+        self.assertFalse(auto_boot.should_run(config, now, unavailable, self.logger))
+
+    def test_offline_sunday_never_runs(self):
+        now = dt.datetime(2026, 7, 19, 9, 33)
+
+        def unavailable(_):
+            raise RuntimeError("offline")
+
+        self.assertEqual(now.weekday(), 6)
+        self.assertFalse(auto_boot.should_run(self.config, now, unavailable, self.logger))
+
+
+class HolidaySourceTests(unittest.TestCase):
+    def setUp(self):
+        self.year_data = {
+            "year": 2026,
+            "days": [
+                {"name": "春节", "date": "2026-02-17", "isOffDay": True},
+                {"name": "春节", "date": "2026-02-14", "isOffDay": False},
+            ],
+        }
+
+    def test_year_data_supports_holiday_and_weekend_makeup_day(self):
+        self.assertEqual(
+            auto_boot.day_type_from_year_data(dt.date(2026, 2, 17), self.year_data),
+            (2, "春节"),
+        )
+        self.assertEqual(
+            auto_boot.day_type_from_year_data(dt.date(2026, 2, 14), self.year_data),
+            (3, "春节调休"),
+        )
+
+    @patch("auto_boot.fetch_json")
+    @patch("auto_boot.fetch_timor_day_type", side_effect=OSError("primary offline"))
+    def test_cdn_backup_is_cached(self, _primary: Mock, fetch_json: Mock):
+        fetch_json.return_value = self.year_data
+        with tempfile.TemporaryDirectory() as directory:
+            cache_dir = Path(directory)
+            result = auto_boot.fetch_day_type(dt.date(2026, 2, 17), cache_dir)
+            self.assertEqual(result, (2, "春节"))
+            self.assertTrue((cache_dir / "2026.json").is_file())
+
+    @patch("auto_boot.fetch_json")
+    @patch("auto_boot.fetch_timor_day_type", return_value=(0, "工作日"))
+    def test_primary_success_also_prepares_year_cache(self, _primary: Mock, fetch_json: Mock):
+        fetch_json.return_value = self.year_data
+        with tempfile.TemporaryDirectory() as directory:
+            cache_dir = Path(directory)
+            result = auto_boot.fetch_day_type(dt.date(2026, 7, 20), cache_dir)
+            self.assertEqual(result, (0, "工作日"))
+            self.assertTrue((cache_dir / "2026.json").is_file())
+
+
+    @patch("auto_boot.fetch_timor_day_type")
+    def test_existing_cache_avoids_network_request(self, mock_timor: Mock):
+        with tempfile.TemporaryDirectory() as directory:
+            cache_dir = Path(directory)
+            auto_boot.write_holiday_cache(2026, self.year_data, cache_dir)
+            result = auto_boot.fetch_day_type(dt.date(2026, 2, 17), cache_dir)
+            self.assertEqual(result, (2, "春节"))
+            mock_timor.assert_not_called()
+
+
+class LaunchTests(unittest.TestCase):
+    def setUp(self):
+        self.logger = auto_boot.logging.getLogger("test-boot-runner-launch")
+        self.logger.addHandler(auto_boot.logging.NullHandler())
+
+    def test_session_zero_is_noninteractive(self):
+        def report_session_zero(_process_id, session_id):
+            session_id._obj.value = 0
+            return 1
+
+        with patch.object(
+            auto_boot.ctypes.windll.kernel32,
+            "ProcessIdToSessionId",
+            side_effect=report_session_zero,
+        ):
+            self.assertTrue(auto_boot.is_noninteractive_session())
+
+    @patch("auto_boot.is_noninteractive_session", return_value=True)
+    @patch("auto_boot.start_windows_service", return_value=True)
+    @patch("auto_boot.find_related_services", return_value=["GameViewerService"])
+    @patch("auto_boot.Path.is_file", return_value=True)
+    @patch("auto_boot.subprocess.Popen")
+    def test_system_uses_service_instead_of_gui(
+        self,
+        popen: Mock,
+        _is_file: Mock,
+        _find: Mock,
+        start_service: Mock,
+        _noninteractive: Mock,
+    ):
+        count = auto_boot.launch_programs(
+            [r"D:\uu\GameViewer\GameViewer.exe"], self.logger
+        )
+        self.assertEqual(count, 1)
+        start_service.assert_called_once_with("GameViewerService", self.logger)
+        popen.assert_not_called()
+
+    @patch("auto_boot.is_noninteractive_session", return_value=False)
+    @patch("auto_boot.is_process_running", return_value=True)
+    @patch("auto_boot.Path.is_file", return_value=True)
+    @patch("auto_boot.subprocess.Popen")
+    def test_running_process_is_skipped(
+        self,
+        popen: Mock,
+        _is_file: Mock,
+        _is_running: Mock,
+        _noninteractive: Mock,
+    ):
+        count = auto_boot.launch_programs(
+            [r"D:\Tools\DemoApp.exe"], self.logger
+        )
+        self.assertEqual(count, 1)
+        popen.assert_not_called()
+
+
+class EnhancementTests(unittest.TestCase):
+    def test_get_app_dir_frozen_vs_normal(self):
+        import sys
+        # 普通源码模式
+        with patch.object(sys, "frozen", False, create=True):
+            app_dir = auto_boot.get_app_dir()
+            self.assertEqual(app_dir, Path(auto_boot.__file__).resolve().parent)
+
+        # PyInstaller 冻结打包模式
+        with patch.object(sys, "frozen", True, create=True), patch.object(
+            sys, "executable", r"C:\MyTools\BootRunner.exe"
+        ):
+            app_dir = auto_boot.get_app_dir()
+            self.assertEqual(app_dir, Path(r"C:\MyTools"))
+
+    @patch("auto_boot.subprocess.run")
+    def test_is_system_autostart_enabled_multilingual(self, mock_run: Mock):
+        # 繁体中文“存取被拒”
+        mock_run.return_value = Mock(returncode=1, stdout="", stderr="錯誤: 存取被拒。")
+        self.assertTrue(auto_boot.is_system_autostart_enabled())
+
+        # 日文
+        mock_run.return_value = Mock(returncode=1, stdout="", stderr="エラー: アクセスが拒否されました。")
+        self.assertTrue(auto_boot.is_system_autostart_enabled())
+
+        # 错误码 0x80070005
+        mock_run.return_value = Mock(returncode=1, stdout="0x80070005", stderr="")
+        self.assertTrue(auto_boot.is_system_autostart_enabled())
+
+        # 任务不存在
+        mock_run.return_value = Mock(returncode=1, stdout="", stderr="ERROR: The system cannot find the file specified.")
+        self.assertFalse(auto_boot.is_system_autostart_enabled())
+
+    def test_read_log_tail_safe_truncation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "test.log"
+            content = "Line1: [2026-09-06 08:00:00] 开机启动测试\nLine2: [2026-09-06 08:00:05] 第二行中文日志\n"
+            log_path.write_text(content, encoding="utf-8")
+            # 当 limit 小于文件大小时，应安全丢弃第一行残断
+            tail = auto_boot.read_log_tail(log_path, limit=len(content.encode("utf-8")) - 10)
+            self.assertIn("Line2: [2026-09-06 08:00:05] 第二行中文日志", tail)
+            self.assertNotIn("Line1:", tail)
+
+    def test_run_ui_ignores_time_window(self):
+        config = auto_boot.DEFAULT_CONFIG | {
+            "start_time": "08:00",
+            "cutoff_time": "18:00",
+            "check_workday": True,
+        }
+        # 晚于 cutoff 时间（19:00），但是工作日
+        now = dt.datetime(2026, 7, 14, 19, 0)
+        provider = lambda _: (0, "工作日")
+        logger = auto_boot.logging.getLogger("test-run-ui")
+        logger.addHandler(auto_boot.logging.NullHandler())
+
+        # 默认模式拒绝
+        self.assertFalse(auto_boot.should_run(config, now, provider, logger, check_window=True))
+        # 登录托盘模式（check_window=False）允许
+        self.assertTrue(auto_boot.should_run(config, now, provider, logger, check_window=False))
+
+    def test_find_related_services_unquoted_space_path(self):
+        mock_keys = {
+            "AppService": (r"C:\Program Files\Vendor\App\AppService.exe -k run", 1)
+        }
+
+        class MockKey:
+            def __init__(self, name):
+                self.name = name
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+
+        def mock_enum(key, index):
+            names = list(mock_keys.keys())
+            if index < len(names):
+                return names[index]
+            raise OSError("no more")
+
+        def mock_query(key, val_name):
+            if val_name == "ImagePath":
+                return mock_keys[key.name]
+            raise OSError("not found")
+
+        with patch("winreg.OpenKey", side_effect=lambda root, name: MockKey(name)), \
+             patch("winreg.EnumKey", side_effect=mock_enum), \
+             patch("winreg.QueryValueEx", side_effect=mock_query):
+            services = auto_boot.find_related_services(Path(r"C:\Program Files\Vendor\App\App.exe"))
+            self.assertEqual(services, ["AppService"])
+
+
+if __name__ == "__main__":
+    unittest.main()

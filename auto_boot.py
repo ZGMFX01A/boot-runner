@@ -10,6 +10,7 @@ from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -19,8 +20,15 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 
+def get_app_dir() -> Path:
+    """获取程序所在目录（兼容源码运行与 PyInstaller 打包为 exe 的场景）"""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
 APP_NAME = "BootRunner"
-APP_DIR = Path(os.getenv("APPDATA", Path.home())) / APP_NAME
+APP_DIR = get_app_dir()
 CONFIG_FILE = APP_DIR / "config.json"
 LOG_FILE = APP_DIR / "boot-runner.log"
 HOLIDAY_CACHE_DIR = APP_DIR / "holidays"
@@ -158,25 +166,25 @@ def write_holiday_cache(year: int, payload: Any, cache_dir: Path) -> None:
 def fetch_day_type(
     date: dt.date, cache_dir: Path = HOLIDAY_CACHE_DIR
 ) -> tuple[int, str]:
-    errors: list[str] = []
+    # 优先使用本地有效缓存，避免开机断网/弱网时无谓等待 5 秒超时
     cached = read_holiday_cache(date, cache_dir)
+    if cached is not None:
+        return day_type_from_year_data(date, cached)
+
+    errors: list[str] = []
     try:
         result = fetch_timor_day_type(date)
-        if cached is None:
-            for template in HOLIDAY_DATA_URLS:
-                try:
-                    payload = fetch_json(template.format(year=date.year))
-                    day_type_from_year_data(date, payload)
-                    write_holiday_cache(date.year, payload, cache_dir)
-                    break
-                except (HTTPError, URLError, TimeoutError, OSError, ValueError, KeyError, TypeError):
-                    continue
+        for template in HOLIDAY_DATA_URLS:
+            try:
+                payload = fetch_json(template.format(year=date.year))
+                day_type_from_year_data(date, payload)
+                write_holiday_cache(date.year, payload, cache_dir)
+                break
+            except (HTTPError, URLError, TimeoutError, OSError, ValueError, KeyError, TypeError):
+                continue
         return result
     except (HTTPError, URLError, TimeoutError, OSError, ValueError, KeyError, TypeError) as error:
         errors.append(f"timor.tech: {error}")
-
-    if cached is not None:
-        return day_type_from_year_data(date, cached)
 
     for template in HOLIDAY_DATA_URLS:
         url = template.format(year=date.year)
@@ -195,23 +203,28 @@ def should_run(
     now: dt.datetime | None = None,
     day_type_provider: Callable[[dt.date], tuple[int, str]] = fetch_day_type,
     log: logging.Logger | None = None,
+    check_window: bool = True,
 ) -> bool:
     config = validate_config(config)
     now = now or dt.datetime.now()
-    start = dt.datetime.strptime(config["start_time"], "%H:%M").time()
-    cutoff = dt.datetime.strptime(config["cutoff_time"], "%H:%M").time()
     logger = log or get_logger()
     logger.info("开始检查，当前时间 %s", now.strftime("%Y-%m-%d %H:%M:%S"))
 
-    current = now.time()
-    in_window = start <= current <= cutoff if start <= cutoff else current >= start or current <= cutoff
-    if not in_window:
-        logger.info(
-            "当前时间不在启动窗口 %s-%s，不启动",
-            config["start_time"],
-            config["cutoff_time"],
-        )
-        return False
+    if check_window:
+        start = dt.datetime.strptime(config["start_time"], "%H:%M").time()
+        cutoff = dt.datetime.strptime(config["cutoff_time"], "%H:%M").time()
+        current = now.time()
+        in_window = start <= current <= cutoff if start <= cutoff else current >= start or current <= cutoff
+        if not in_window:
+            logger.info(
+                "当前时间不在启动窗口 %s-%s，不启动",
+                config["start_time"],
+                config["cutoff_time"],
+            )
+            return False
+    else:
+        logger.info("已跳过时间窗口检查（登录托盘模式）")
+
     if not config["check_workday"]:
         logger.info("未启用工作日检查，允许启动")
         return True
@@ -234,6 +247,22 @@ def should_run(
             logger.info("接口不可用，但本地日历为周一至周五；已启用断网兜底，允许启动")
             return True
         logger.info("未启用断网兜底，不启动")
+        return False
+
+
+def is_process_running(executable_name: str) -> bool:
+    """检查指定可执行文件名是否已在系统中运行"""
+    if os.name != "nt":
+        return False
+    try:
+        result = subprocess.run(
+            ["tasklist.exe", "/FI", f"IMAGENAME eq {executable_name}", "/FO", "CSV", "/NH"],
+            capture_output=True,
+            text=True,
+            errors="replace",
+        )
+        return executable_name.casefold() in result.stdout.casefold()
+    except OSError:
         return False
 
 
@@ -263,6 +292,10 @@ def launch_programs(programs: list[str], log: logging.Logger | None = None) -> i
                 path,
             )
             continue
+        if is_process_running(path.name):
+            logger.info("程序已在运行中，跳过重复启动：%s", path)
+            launched += 1
+            continue
         try:
             subprocess.Popen([str(path)], cwd=str(path.parent))
             logger.info("已启动：%s", path)
@@ -291,6 +324,11 @@ def find_related_services(program: Path) -> list[str]:
     matches: list[str] = []
     program_stem = program.stem.casefold()
     try:
+        norm_prog_parent = os.path.normcase(str(program.parent.resolve()))
+    except (OSError, ValueError):
+        norm_prog_parent = str(program.parent).casefold()
+
+    try:
         root = winreg.OpenKey(
             winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Services"
         )
@@ -313,9 +351,22 @@ def find_related_services(program: Path) -> list[str]:
             if image_path.startswith('"'):
                 executable = image_path.split('"', 2)[1]
             else:
-                executable = image_path.split(" ", 1)[0]
+                m = re.match(r'^(.*?\.(?:exe|bat|cmd))(?:\s.*)?$', image_path, re.IGNORECASE)
+                if m:
+                    executable = m.group(1)
+                else:
+                    executable = image_path.split(" ", 1)[0]
             service_path = Path(executable.removeprefix("\\??\\"))
-            same_directory = str(service_path.parent).casefold() == str(program.parent).casefold()
+            try:
+                norm_service_parent = os.path.normcase(str(service_path.parent.resolve()))
+            except (OSError, ValueError):
+                norm_service_parent = str(service_path.parent).casefold()
+
+            same_directory = (
+                norm_service_parent == norm_prog_parent
+                or norm_service_parent.startswith(norm_prog_parent + os.sep)
+                or norm_prog_parent.startswith(norm_service_parent + os.sep)
+            )
             related_name = (
                 program_stem in service_path.stem.casefold()
                 or service_path.stem.casefold() in program_stem
@@ -340,6 +391,7 @@ def start_windows_service(name: str, log: logging.Logger) -> bool:
 def run_once(
     config: dict[str, Any] | None = None,
     wait: bool = True,
+    check_window: bool = True,
     config_path: Path = CONFIG_FILE,
     log_path: Path = LOG_FILE,
 ) -> int:
@@ -353,7 +405,7 @@ def run_once(
         time.sleep(config["startup_delay"])
     holiday_cache = config_path.parent / "holidays"
     provider = lambda date: fetch_day_type(date, holiday_cache)
-    if not should_run(config, day_type_provider=provider, log=logger):
+    if not should_run(config, day_type_provider=provider, log=logger, check_window=check_window):
         return 0
     return launch_programs(config["programs"], logger)
 
@@ -415,7 +467,17 @@ def is_system_autostart_enabled() -> bool:
         check=False,
     )
     output = f"{result.stdout}\n{result.stderr}".casefold()
-    return result.returncode == 0 or "access is denied" in output or "拒绝访问" in output
+    denied_keywords = (
+        "access is denied",
+        "拒绝访问",
+        "存取被拒",
+        "アクセスが拒否",
+        "accès refusé",
+        "zugriff verweigert",
+        "0x80070005",
+    )
+    is_denied = any(kw in output for kw in denied_keywords)
+    return result.returncode == 0 or is_denied
 
 
 def set_system_autostart(
@@ -491,7 +553,10 @@ def read_log_tail(path: Path = LOG_FILE, limit: int = 200_000) -> str:
         size = stream.tell()
         stream.seek(max(0, size - limit))
         data = stream.read()
-    return data.decode("utf-8", errors="replace")
+    text = data.decode("utf-8", errors="replace")
+    if size > limit and "\n" in text:
+        text = text.split("\n", 1)[1]
+    return text
 
 
 class BootRunnerApp:
@@ -655,9 +720,10 @@ class BootRunnerApp:
         )
         existing = set(self.program_list.get(0, "end"))
         for path in paths:
-            if path not in existing:
-                self.program_list.insert("end", path)
-                existing.add(path)
+            norm_path = os.path.normpath(path)
+            if norm_path not in existing:
+                self.program_list.insert("end", norm_path)
+                existing.add(norm_path)
 
     def _remove_program(self) -> None:
         for index in reversed(self.program_list.curselection()):
@@ -700,6 +766,7 @@ class BootRunnerApp:
                 run_elevated_autostart_helper(desired_autostart)
             set_user_ui_autostart(desired_autostart)
         except (OSError, ValueError) as error:
+            self.autostart.set(is_system_autostart_enabled())
             messagebox.showerror("保存失败", str(error), parent=self.root)
             return False
         self.status.set("设置已保存")
@@ -782,7 +849,7 @@ def main() -> int:
         run_once(config_path=args.config, log_path=args.log)
         return 0
     if args.run_ui:
-        run_once(wait=False, config_path=args.config, log_path=args.log)
+        run_once(wait=False, check_window=False, config_path=args.config, log_path=args.log)
         return 0
     BootRunnerApp().run()
     return 0
