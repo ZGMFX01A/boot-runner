@@ -10,22 +10,35 @@ import subprocess
 import sys
 
 
+# 确保在任何语言区域的终端下均能安全输出 UTF-8 文本，防止在 Windows CI (cp1252) 下抛出 UnicodeEncodeError
+if sys.stdout and hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+if sys.stderr and hasattr(sys.stderr, "reconfigure"):
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+
 def build() -> int:
     project_dir = Path(__file__).resolve().parent
     entry_script = project_dir / "auto_boot.py"
     dist_dir = project_dir / "dist"
     build_dir = project_dir / "build"
 
-    print(f"[*] 开始构建 Boot Runner 可执行文件...")
-    print(f"[*] 项目根目录: {project_dir}")
-    print(f"[*] 入口文件: {entry_script}")
+    print(f"[*] Starting Boot Runner build process...")
+    print(f"[*] Project root: {project_dir}")
+    print(f"[*] Entry script: {entry_script}")
 
     # 检查 PyInstaller 是否可用
     try:
         import PyInstaller  # noqa: F401
     except ImportError:
-        print("[!] 错误: 当前环境中未安装 PyInstaller。")
-        print("[!] 请先运行: pip install pyinstaller")
+        print("[!] Error: PyInstaller is not installed in the current environment.")
+        print("[!] Please run: pip install pyinstaller")
         return 1
 
     cmd = [
@@ -41,22 +54,21 @@ def build() -> int:
         str(entry_script),
     ]
 
-    print(f"[*] 执行构建命令: {' '.join(cmd)}")
+    print(f"[*] Executing build command: {' '.join(cmd)}")
     result = subprocess.run(cmd, cwd=str(project_dir))
 
     if result.returncode != 0:
-        print(f"[!] 构建失败，退出码: {result.returncode}")
+        print(f"[!] Build failed with exit code: {result.returncode}")
         return result.returncode
 
     target_exe = dist_dir / "BootRunner.exe"
     if target_exe.is_file():
         size_mb = target_exe.stat().st_size / (1024 * 1024)
-        print(f"[+] 构建成功！")
-        print(f"[+] 目标文件: {target_exe} ({size_mb:.2f} MB)")
-        print(f"[+] 日志、配置及节假日缓存文件将在运行时默认保存在与 BootRunner.exe 同级的目录下。")
+        print(f"[+] Build succeeded!")
+        print(f"[+] Output executable: {target_exe} ({size_mb:.2f} MB)")
         return 0
     else:
-        print("[!] 构建命令完成，但未找到预期的输出文件。")
+        print("[!] Build command finished but expected output file was not found.")
         return 1
 
 
