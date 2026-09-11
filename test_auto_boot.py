@@ -256,22 +256,16 @@ class EnhancementTests(unittest.TestCase):
             self.assertIn("Line2: [2026-09-06 08:00:05] 第二行中文日志", tail)
             self.assertNotIn("Line1:", tail)
 
-    def test_run_ui_ignores_time_window(self):
-        config = auto_boot.DEFAULT_CONFIG | {
-            "start_time": "08:00",
-            "cutoff_time": "18:00",
-            "check_workday": True,
-        }
-        # 晚于 cutoff 时间（19:00），但是工作日
-        now = dt.datetime(2026, 7, 14, 19, 0)
-        provider = lambda _: (0, "工作日")
-        logger = auto_boot.logging.getLogger("test-run-ui")
-        logger.addHandler(auto_boot.logging.NullHandler())
-
-        # 默认模式拒绝
-        self.assertFalse(auto_boot.should_run(config, now, provider, logger, check_window=True))
-        # 登录托盘模式（check_window=False）允许
-        self.assertTrue(auto_boot.should_run(config, now, provider, logger, check_window=False))
+    @patch("auto_boot.run_once")
+    def test_run_ui_enforces_time_window(self, run_once: Mock):
+        with patch.object(auto_boot.sys, "argv", ["auto_boot.py", "--run-ui"]):
+            self.assertEqual(auto_boot.main(), 0)
+        run_once.assert_called_once_with(
+            wait=False,
+            check_window=True,
+            config_path=auto_boot.CONFIG_FILE,
+            log_path=auto_boot.LOG_FILE,
+        )
 
     def test_find_related_services_unquoted_space_path(self):
         mock_keys = {

@@ -849,7 +849,7 @@ def main() -> int:
         run_once(config_path=args.config, log_path=args.log)
         return 0
     if args.run_ui:
-        run_once(wait=False, check_window=False, config_path=args.config, log_path=args.log)
+        run_once(wait=False, check_window=True, config_path=args.config, log_path=args.log)
         return 0
     BootRunnerApp().run()
     return 0
