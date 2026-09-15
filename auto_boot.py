@@ -47,6 +47,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "check_workday": True,
     "run_when_offline": True,
 }
+SERVICE_START_TIMEOUT = 15.0
+SERVICE_POLL_INTERVAL = 0.5
 
 
 def load_config(path: Path = CONFIG_FILE) -> dict[str, Any]:
@@ -62,10 +64,25 @@ def load_config(path: Path = CONFIG_FILE) -> dict[str, Any]:
 
 
 def validate_config(config: dict[str, Any]) -> dict[str, Any]:
-    programs = config.get("programs", [])
-    if not isinstance(programs, list):
-        programs = []
-    programs = [str(item) for item in programs if isinstance(item, str) and item.strip()]
+    raw_programs = config.get("programs", [])
+    if not isinstance(raw_programs, list):
+        raw_programs = []
+    programs: list[dict[str, str]] = []
+    for item in raw_programs:
+        if isinstance(item, str):
+            path = item.strip()
+            service_name = ""
+        elif isinstance(item, dict):
+            raw_path = item.get("path", "")
+            raw_service_name = item.get("service_name", "")
+            path = raw_path.strip() if isinstance(raw_path, str) else ""
+            service_name = (
+                raw_service_name.strip() if isinstance(raw_service_name, str) else ""
+            )
+        else:
+            continue
+        if path:
+            programs.append({"path": path, "service_name": service_name})
 
     def valid_time(key: str) -> str:
         value = str(config.get(key, DEFAULT_CONFIG[key]))
@@ -266,31 +283,34 @@ def is_process_running(executable_name: str) -> bool:
         return False
 
 
-def launch_programs(programs: list[str], log: logging.Logger | None = None) -> int:
+def launch_programs(
+    programs: list[str | dict[str, str]], log: logging.Logger | None = None
+) -> int:
     logger = log or get_logger()
     launched = 0
-    for value in programs:
+    for item in programs:
+        if isinstance(item, dict):
+            value = item.get("path", "")
+            service_name = item.get("service_name", "").strip()
+        else:
+            value = item
+            service_name = ""
         path = Path(value).expanduser()
         if not path.is_file():
             logger.error("找不到程序：%s", path)
             continue
         noninteractive = is_noninteractive_session()
-        related_services = find_related_services(path) if noninteractive else []
-        if related_services:
-            for service in related_services:
-                if start_windows_service(service, logger):
-                    launched += 1
-            logger.info(
-                "SYSTEM 模式下不启动桌面程序 %s，已改用配套服务：%s",
-                path,
-                ", ".join(related_services),
-            )
-            continue
         if noninteractive:
-            logger.error(
-                "已跳过不具备配套服务的桌面程序：%s；桌面程序不能在登录前的 Session 0 中可靠运行",
-                path,
-            )
+            if not service_name:
+                logger.error("SYSTEM 模式下未配置 Windows 服务名，已跳过：%s", path)
+                continue
+            if start_windows_service(service_name, logger):
+                launched += 1
+                logger.info(
+                    "SYSTEM 模式下不启动桌面程序 %s，已启动显式配置的 Windows 服务：%s",
+                    path,
+                    service_name,
+                )
             continue
         if is_process_running(path.name):
             logger.info("程序已在运行中，跳过重复启动：%s", path)
@@ -316,75 +336,68 @@ def is_noninteractive_session() -> bool:
     return os.environ.get("USERNAME", "").upper() == "SYSTEM"
 
 
-def find_related_services(program: Path) -> list[str]:
-    if os.name != "nt":
-        return []
-    import winreg
+def service_is_running(output: str) -> bool:
+    return bool(re.search(r"\bSTATE\s*:\s*4\s+RUNNING\b", output, re.IGNORECASE))
 
-    matches: list[str] = []
-    program_stem = program.stem.casefold()
-    try:
-        norm_prog_parent = os.path.normcase(str(program.parent.resolve()))
-    except (OSError, ValueError):
-        norm_prog_parent = str(program.parent).casefold()
 
+def wait_for_windows_service_running(
+    name: str,
+    log: logging.Logger,
+    timeout: float = SERVICE_START_TIMEOUT,
+    poll_interval: float = SERVICE_POLL_INTERVAL,
+) -> bool:
+    deadline = time.monotonic() + max(0.0, timeout)
+    last_output = ""
+    while True:
+        remaining = max(0.0, deadline - time.monotonic())
+        try:
+            result = subprocess.run(
+                ["sc.exe", "query", name],
+                capture_output=True,
+                text=True,
+                errors="replace",
+                check=False,
+                timeout=remaining,
+            )
+        except subprocess.TimeoutExpired:
+            log.error("Windows 服务状态查询超时：%s", name)
+            return False
+        last_output = f"{result.stdout}\n{result.stderr}"
+        if result.returncode == 0 and service_is_running(last_output):
+            return True
+        if time.monotonic() >= deadline:
+            log.error("Windows 服务未进入 RUNNING 状态：%s；%s", name, last_output.strip())
+            return False
+        time.sleep(min(poll_interval, max(0.0, deadline - time.monotonic())))
+
+
+def start_windows_service(
+    name: str,
+    log: logging.Logger,
+    timeout: float = SERVICE_START_TIMEOUT,
+) -> bool:
+    deadline = time.monotonic() + max(0.0, timeout)
     try:
-        root = winreg.OpenKey(
-            winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Services"
+        result = subprocess.run(
+            ["sc.exe", "start", name],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            check=False,
+            timeout=max(0.0, deadline - time.monotonic()),
         )
-    except OSError:
-        return []
-    with root:
-        index = 0
-        while True:
-            try:
-                service_name = winreg.EnumKey(root, index)
-                index += 1
-            except OSError:
-                break
-            try:
-                with winreg.OpenKey(root, service_name) as service_key:
-                    image_path = str(winreg.QueryValueEx(service_key, "ImagePath")[0])
-            except OSError:
-                continue
-            image_path = os.path.expandvars(image_path.strip())
-            if image_path.startswith('"'):
-                executable = image_path.split('"', 2)[1]
-            else:
-                m = re.match(r'^(.*?\.(?:exe|bat|cmd))(?:\s.*)?$', image_path, re.IGNORECASE)
-                if m:
-                    executable = m.group(1)
-                else:
-                    executable = image_path.split(" ", 1)[0]
-            service_path = Path(executable.removeprefix("\\??\\"))
-            try:
-                norm_service_parent = os.path.normcase(str(service_path.parent.resolve()))
-            except (OSError, ValueError):
-                norm_service_parent = str(service_path.parent).casefold()
-
-            same_directory = (
-                norm_service_parent == norm_prog_parent
-                or norm_service_parent.startswith(norm_prog_parent + os.sep)
-                or norm_prog_parent.startswith(norm_service_parent + os.sep)
-            )
-            related_name = (
-                program_stem in service_path.stem.casefold()
-                or service_path.stem.casefold() in program_stem
-            )
-            if same_directory and related_name:
-                matches.append(service_name)
-    return matches
-
-
-def start_windows_service(name: str, log: logging.Logger) -> bool:
-    result = subprocess.run(
-        ["sc.exe", "start", name], capture_output=True, text=True, errors="replace"
-    )
+    except subprocess.TimeoutExpired:
+        log.error("Windows 服务启动请求超时：%s", name)
+        return False
     output = f"{result.stdout}\n{result.stderr}"
-    if result.returncode == 0 or "1056" in output:
-        log.info("Windows 服务已运行：%s", name)
+    if result.returncode and "1056" not in output:
+        log.error("Windows 服务启动请求失败：%s；%s", name, output.strip())
+        return False
+    if wait_for_windows_service_running(
+        name, log, timeout=max(0.0, deadline - time.monotonic())
+    ):
+        log.info("Windows 服务已确认进入 RUNNING 状态：%s", name)
         return True
-    log.error("Windows 服务启动失败：%s；%s", name, output.strip())
     return False
 
 
@@ -455,7 +468,37 @@ def set_user_ui_autostart(enabled: bool) -> None:
                 pass
 
 
-def is_system_autostart_enabled() -> bool:
+def user_ui_autostart_needs_sync(desired: bool) -> bool | None:
+    if os.name != "nt":
+        return False
+    import winreg
+
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
+            try:
+                value = winreg.QueryValueEx(key, UI_RUN_VALUE)[0]
+            except FileNotFoundError:
+                value = None
+            try:
+                winreg.QueryValueEx(key, APP_NAME)
+                legacy_exists = True
+            except FileNotFoundError:
+                legacy_exists = False
+            if legacy_exists:
+                return True
+            if value is None:
+                return desired
+            if str(value).strip() != user_ui_command().strip():
+                return True
+            return not desired
+    except FileNotFoundError:
+        return desired
+    except OSError:
+        return None
+
+
+def system_autostart_status() -> bool | None:
+    """返回任务状态；None 表示查询失败且不能确认任务是否存在。"""
     if os.name != "nt":
         return False
     result = subprocess.run(
@@ -476,8 +519,49 @@ def is_system_autostart_enabled() -> bool:
         "zugriff verweigert",
         "0x80070005",
     )
-    is_denied = any(kw in output for kw in denied_keywords)
-    return result.returncode == 0 or is_denied
+    if result.returncode == 0:
+        return True
+    if any(kw in output for kw in denied_keywords):
+        return None
+    not_found_keywords = (
+        "cannot find",
+        "找不到",
+        "不存在",
+        "not exist",
+        "指定されたファイルが見つかりません",
+    )
+    if any(kw in output for kw in not_found_keywords):
+        return False
+    return None
+
+
+def is_system_autostart_enabled() -> bool:
+    return system_autostart_status() is True
+
+
+def should_update_system_autostart(
+    current: bool | None, desired: bool, user_changed: bool
+) -> bool:
+    """未知状态下仅在用户明确操作开关时才允许修改自启配置。"""
+    if current is None:
+        return user_changed
+    return current != desired
+
+
+def autostart_update_plan(
+    system_status: bool | None,
+    user_ui_needs_sync: bool | None,
+    desired: bool,
+    user_changed: bool,
+) -> tuple[bool, bool]:
+    """决定是否分别更新 SYSTEM 任务和当前用户的登录项。"""
+    if system_status is None and not user_changed:
+        return False, False
+    update_system = should_update_system_autostart(
+        system_status, desired, user_changed
+    )
+    update_user_ui = user_changed if user_ui_needs_sync is None else user_ui_needs_sync
+    return update_system, update_user_ui
 
 
 def set_system_autostart(
@@ -504,9 +588,16 @@ def set_system_autostart(
     else:
         command = ["schtasks.exe", "/Delete", "/TN", TASK_NAME, "/F"]
     result = subprocess.run(command, capture_output=True, text=True, errors="replace")
-    if result.returncode and not (not enabled and not is_system_autostart_enabled()):
+    status = system_autostart_status()
+    if result.returncode:
+        if not enabled and status is False:
+            return
         detail = result.stderr.strip() or result.stdout.strip() or f"错误码 {result.returncode}"
         raise OSError(f"计划任务操作失败：{detail}")
+    if enabled and status is not True:
+        raise OSError("计划任务创建后验证失败，无法确认 BootRunner Startup 已存在。")
+    if not enabled and status is not False:
+        raise OSError("计划任务删除后验证失败，无法确认 BootRunner Startup 已删除。")
 
 
 def run_elevated_autostart_helper(enabled: bool) -> None:
@@ -571,6 +662,13 @@ class BootRunnerApp:
         self.root.geometry("820x620")
         self.root.minsize(700, 520)
         self.config = load_config()
+        self.service_names = {
+            program["path"]: program["service_name"]
+            for program in self.config["programs"]
+        }
+        self.selected_program_path: str | None = None
+        self.autostart_status = system_autostart_status()
+        self.autostart_changed = False
         self.messages: queue.Queue[tuple[str, str]] = queue.Queue()
         self.last_log_state: tuple[int, int] | None = None
 
@@ -618,18 +716,32 @@ class BootRunnerApp:
         self.program_list.configure(yscrollcommand=scrollbar.set)
         self.program_list.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
+        self.program_list.bind("<<ListboxSelect>>", self._on_program_selected)
         for program in self.config["programs"]:
-            self.program_list.insert("end", program)
+            self.program_list.insert("end", program["path"])
+
+        service_frame = ttk.Frame(tab)
+        service_frame.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(0, 8))
+        ttk.Label(service_frame, text="选中程序的 Windows 服务名").pack(side="left")
+        self.service_name = self.tk.StringVar()
+        ttk.Entry(service_frame, textvariable=self.service_name, width=34).pack(
+            side="left", padx=(10, 0)
+        )
+        ttk.Label(
+            service_frame,
+            text="（登录前启动服务时必填；可留空表示只在登录后启动 GUI）",
+            style="Hint.TLabel",
+        ).pack(side="left", padx=(8, 0))
 
         ttk.Button(tab, text="添加软件...", command=self._add_program).grid(
-            row=2, column=0, sticky="w"
+            row=3, column=0, sticky="w"
         )
         ttk.Button(tab, text="移除选中", command=self._remove_program).grid(
-            row=2, column=1, sticky="w", padx=(8, 0)
+            row=3, column=1, sticky="w", padx=(8, 0)
         )
 
         options = ttk.LabelFrame(tab, text="执行规则", padding=12)
-        options.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(18, 12))
+        options.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(18, 12))
         ttk.Label(options, text="开始时间").grid(row=0, column=0, sticky="w")
         start_hour, start_minute = self.config["start_time"].split(":")
         self.start_hour = self.tk.StringVar(value=start_hour)
@@ -661,25 +773,30 @@ class BootRunnerApp:
 
         self.check_workday = self.tk.BooleanVar(value=self.config["check_workday"])
         self.run_offline = self.tk.BooleanVar(value=self.config["run_when_offline"])
-        self.autostart = self.tk.BooleanVar(value=is_system_autostart_enabled())
+        self.autostart = self.tk.BooleanVar(value=self.autostart_status is True)
         ttk.Checkbutton(options, text="仅工作日和调休工作日启动", variable=self.check_workday).grid(
             row=2, column=0, columnspan=4, sticky="w", pady=(12, 0)
         )
         ttk.Checkbutton(options, text="接口不可用时，普通周一至周五仍启动", variable=self.run_offline).grid(
             row=3, column=0, columnspan=4, sticky="w", pady=(6, 0)
         )
-        ttk.Checkbutton(options, text="登录前启动服务，登录后显示软件托盘图标", variable=self.autostart).grid(
+        ttk.Checkbutton(
+            options,
+            text="登录前启动服务，登录后显示软件托盘图标",
+            variable=self.autostart,
+            command=self._mark_autostart_changed,
+        ).grid(
             row=4, column=0, columnspan=4, sticky="w", pady=(6, 0)
         )
         ttk.Label(
             options,
-            text="注意：普通桌面程序在登录前位于 Session 0，不会显示界面；远程软件需自身支持系统服务模式。",
+            text="注意：登录前只启动你为程序明确填写的 Windows 服务，不再根据路径猜测；桌面 GUI 会在用户登录后启动。",
             style="Hint.TLabel",
             wraplength=620,
         ).grid(row=5, column=0, columnspan=6, sticky="w", pady=(8, 0))
 
         actions = ttk.Frame(tab)
-        actions.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        actions.grid(row=5, column=0, columnspan=4, sticky="ew", pady=(8, 0))
         ttk.Button(actions, text="保存设置", command=self._save).pack(side="left")
         ttk.Button(actions, text="立即测试（不等待）", command=self._run_now).pack(
             side="left", padx=(8, 0)
@@ -723,13 +840,32 @@ class BootRunnerApp:
             norm_path = os.path.normpath(path)
             if norm_path not in existing:
                 self.program_list.insert("end", norm_path)
+                self.service_names[norm_path] = ""
                 existing.add(norm_path)
 
     def _remove_program(self) -> None:
+        self._store_selected_service_name()
         for index in reversed(self.program_list.curselection()):
+            self.service_names.pop(self.program_list.get(index), None)
             self.program_list.delete(index)
 
+    def _store_selected_service_name(self, _event: Any = None) -> None:
+        path = self.selected_program_path
+        if path is not None:
+            self.service_names[path] = self.service_name.get().strip()
+
+    def _on_program_selected(self, _event: Any = None) -> None:
+        self._store_selected_service_name()
+        selection = self.program_list.curselection()
+        if selection:
+            self.selected_program_path = self.program_list.get(selection[0])
+            self.service_name.set(self.service_names.get(self.selected_program_path, ""))
+
+    def _mark_autostart_changed(self) -> None:
+        self.autostart_changed = True
+
     def _collect_config(self) -> dict[str, Any]:
+        self._store_selected_service_name()
         try:
             start_hour = int(self.start_hour.get())
             start_minute = int(self.start_minute.get())
@@ -747,7 +883,13 @@ class BootRunnerApp:
         if not times_valid or not 0 <= delay <= 600:
             raise ValueError("时间或等待秒数超出有效范围")
         return {
-            "programs": list(self.program_list.get(0, "end")),
+            "programs": [
+                {
+                    "path": path,
+                    "service_name": self.service_names.get(path, "").strip(),
+                }
+                for path in self.program_list.get(0, "end")
+            ],
             "start_time": f"{start_hour:02d}:{start_minute:02d}",
             "cutoff_time": f"{end_hour:02d}:{end_minute:02d}",
             "startup_delay": delay,
@@ -762,11 +904,22 @@ class BootRunnerApp:
             self.config = self._collect_config()
             save_config(self.config)
             desired_autostart = self.autostart.get()
-            if desired_autostart != is_system_autostart_enabled():
+            current_autostart = system_autostart_status()
+            update_system, update_user_ui = autostart_update_plan(
+                current_autostart,
+                user_ui_autostart_needs_sync(desired_autostart),
+                desired_autostart,
+                self.autostart_changed,
+            )
+            if update_system:
                 run_elevated_autostart_helper(desired_autostart)
-            set_user_ui_autostart(desired_autostart)
+            if update_user_ui:
+                set_user_ui_autostart(desired_autostart)
+            if update_system or update_user_ui:
+                self.autostart_changed = False
         except (OSError, ValueError) as error:
-            self.autostart.set(is_system_autostart_enabled())
+            self.autostart_changed = False
+            self.autostart.set(system_autostart_status() is True)
             messagebox.showerror("保存失败", str(error), parent=self.root)
             return False
         self.status.set("设置已保存")

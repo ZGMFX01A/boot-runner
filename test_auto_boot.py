@@ -12,7 +12,12 @@ class ConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.json"
             config = {
-                "programs": [r"C:\Tools\demo.exe"],
+                "programs": [
+                    {
+                        "path": r"C:\Tools\demo.exe",
+                        "service_name": "DemoService",
+                    }
+                ],
                 "start_time": "07:30",
                 "cutoff_time": "09:05",
                 "startup_delay": 3,
@@ -21,6 +26,13 @@ class ConfigTests(unittest.TestCase):
             }
             auto_boot.save_config(config, path)
             self.assertEqual(auto_boot.load_config(path), config)
+
+    def test_legacy_program_paths_are_migrated_without_a_guessed_service(self):
+        config = auto_boot.validate_config({"programs": [r"C:\Tools\demo.exe"]})
+        self.assertEqual(
+            config["programs"],
+            [{"path": r"C:\Tools\demo.exe", "service_name": ""}],
+        )
 
     def test_invalid_config_uses_safe_defaults(self):
         config = auto_boot.validate_config(
@@ -46,11 +58,46 @@ class ConfigTests(unittest.TestCase):
 
     @patch("auto_boot.subprocess.run")
     def test_system_task_runs_at_boot_as_system(self, run: Mock):
-        run.return_value = Mock(returncode=0, stdout="", stderr="")
+        run.side_effect = [
+            Mock(returncode=0, stdout="", stderr=""),
+            Mock(returncode=0, stdout="TaskName: BootRunner Startup", stderr=""),
+        ]
         auto_boot.set_system_autostart(True)
-        command = run.call_args.args[0]
+        command = run.call_args_list[0].args[0]
         self.assertEqual(command[command.index("/SC") + 1], "ONSTART")
         self.assertEqual(command[command.index("/RU") + 1], "SYSTEM")
+
+    @patch("auto_boot.subprocess.run")
+    def test_system_task_creation_requires_post_create_confirmation(self, run: Mock):
+        run.side_effect = [
+            Mock(returncode=0, stdout="", stderr=""),
+            Mock(returncode=1, stdout="", stderr="Access is denied."),
+        ]
+        with self.assertRaisesRegex(OSError, "创建后验证失败"):
+            auto_boot.set_system_autostart(True)
+
+    def test_unknown_system_autostart_is_changed_only_after_user_action(self):
+        self.assertFalse(auto_boot.should_update_system_autostart(None, False, False))
+        self.assertTrue(auto_boot.should_update_system_autostart(None, True, True))
+        self.assertTrue(auto_boot.should_update_system_autostart(False, True, False))
+
+    def test_autostart_system_and_login_updates_are_independent(self):
+        self.assertEqual(
+            auto_boot.autostart_update_plan(True, True, True, False),
+            (False, True),
+        )
+        self.assertEqual(
+            auto_boot.autostart_update_plan(None, False, False, False),
+            (False, False),
+        )
+        self.assertEqual(
+            auto_boot.autostart_update_plan(None, True, False, True),
+            (True, True),
+        )
+        self.assertEqual(
+            auto_boot.autostart_update_plan(False, True, False, False),
+            (False, True),
+        )
 
 
 class SchedulingTests(unittest.TestCase):
@@ -177,22 +224,42 @@ class LaunchTests(unittest.TestCase):
 
     @patch("auto_boot.is_noninteractive_session", return_value=True)
     @patch("auto_boot.start_windows_service", return_value=True)
-    @patch("auto_boot.find_related_services", return_value=["GameViewerService"])
     @patch("auto_boot.Path.is_file", return_value=True)
     @patch("auto_boot.subprocess.Popen")
-    def test_system_uses_service_instead_of_gui(
+    def test_system_uses_explicit_service_instead_of_gui(
         self,
         popen: Mock,
         _is_file: Mock,
-        _find: Mock,
         start_service: Mock,
         _noninteractive: Mock,
     ):
         count = auto_boot.launch_programs(
-            [r"D:\uu\GameViewer\GameViewer.exe"], self.logger
+            [
+                {
+                    "path": r"D:\uu\GameViewer\GameViewer.exe",
+                    "service_name": "GameViewerService",
+                }
+            ],
+            self.logger,
         )
         self.assertEqual(count, 1)
         start_service.assert_called_once_with("GameViewerService", self.logger)
+        popen.assert_not_called()
+
+    @patch("auto_boot.is_noninteractive_session", return_value=True)
+    @patch("auto_boot.start_windows_service")
+    @patch("auto_boot.Path.is_file", return_value=True)
+    @patch("auto_boot.subprocess.Popen")
+    def test_system_does_not_guess_service_from_program_path(
+        self,
+        popen: Mock,
+        _is_file: Mock,
+        start_service: Mock,
+        _noninteractive: Mock,
+    ):
+        count = auto_boot.launch_programs([r"D:\uu\GameViewer\GameViewer.exe"], self.logger)
+        self.assertEqual(count, 0)
+        start_service.assert_not_called()
         popen.assert_not_called()
 
     @patch("auto_boot.is_noninteractive_session", return_value=False)
@@ -230,21 +297,60 @@ class EnhancementTests(unittest.TestCase):
 
     @patch("auto_boot.subprocess.run")
     def test_is_system_autostart_enabled_multilingual(self, mock_run: Mock):
-        # 繁体中文“存取被拒”
+        # 权限不足不能被误判为“已开启”
         mock_run.return_value = Mock(returncode=1, stdout="", stderr="錯誤: 存取被拒。")
-        self.assertTrue(auto_boot.is_system_autostart_enabled())
+        self.assertFalse(auto_boot.is_system_autostart_enabled())
 
         # 日文
         mock_run.return_value = Mock(returncode=1, stdout="", stderr="エラー: アクセスが拒否されました。")
-        self.assertTrue(auto_boot.is_system_autostart_enabled())
+        self.assertFalse(auto_boot.is_system_autostart_enabled())
 
         # 错误码 0x80070005
         mock_run.return_value = Mock(returncode=1, stdout="0x80070005", stderr="")
-        self.assertTrue(auto_boot.is_system_autostart_enabled())
+        self.assertFalse(auto_boot.is_system_autostart_enabled())
 
         # 任务不存在
         mock_run.return_value = Mock(returncode=1, stdout="", stderr="ERROR: The system cannot find the file specified.")
         self.assertFalse(auto_boot.is_system_autostart_enabled())
+
+    def test_user_ui_autostart_sync_checks_command_and_legacy_value(self):
+        class MockKey:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+        expected = '"C:\\Tools\\BootRunner.exe" --run-ui'
+
+        def query_current(_key, name):
+            if name == auto_boot.UI_RUN_VALUE:
+                return expected, 1
+            raise FileNotFoundError()
+
+        with patch("winreg.OpenKey", return_value=MockKey()), \
+             patch("winreg.QueryValueEx", side_effect=query_current), \
+             patch("auto_boot.user_ui_command", return_value=expected):
+            self.assertFalse(auto_boot.user_ui_autostart_needs_sync(True))
+
+        def query_stale(_key, name):
+            if name == auto_boot.UI_RUN_VALUE:
+                return '"C:\\Old\\BootRunner.exe" --run-ui', 1
+            raise FileNotFoundError()
+
+        with patch("winreg.OpenKey", return_value=MockKey()), \
+             patch("winreg.QueryValueEx", side_effect=query_stale), \
+             patch("auto_boot.user_ui_command", return_value=expected):
+            self.assertTrue(auto_boot.user_ui_autostart_needs_sync(True))
+
+        def query_with_legacy(_key, name):
+            if name == auto_boot.UI_RUN_VALUE:
+                raise FileNotFoundError()
+            return ("legacy command", 1)
+
+        with patch("winreg.OpenKey", return_value=MockKey()), \
+             patch("winreg.QueryValueEx", side_effect=query_with_legacy):
+            self.assertTrue(auto_boot.user_ui_autostart_needs_sync(False))
 
     def test_read_log_tail_safe_truncation(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -267,35 +373,53 @@ class EnhancementTests(unittest.TestCase):
             log_path=auto_boot.LOG_FILE,
         )
 
-    def test_find_related_services_unquoted_space_path(self):
-        mock_keys = {
-            "AppService": (r"C:\Program Files\Vendor\App\AppService.exe -k run", 1)
-        }
+    @patch("auto_boot.subprocess.run")
+    def test_service_start_requires_running_state(self, run: Mock):
+        run.side_effect = [
+            Mock(returncode=0, stdout="[SC] StartService SUCCESS", stderr=""),
+            Mock(
+                returncode=0,
+                stdout="SERVICE_NAME: DemoService\n        STATE              : 4  RUNNING",
+                stderr="",
+            ),
+        ]
+        logger = auto_boot.logging.getLogger("test-service-state")
+        logger.addHandler(auto_boot.logging.NullHandler())
 
-        class MockKey:
-            def __init__(self, name):
-                self.name = name
-            def __enter__(self):
-                return self
-            def __exit__(self, *args):
-                pass
+        self.assertTrue(auto_boot.start_windows_service("DemoService", logger, timeout=0))
+        self.assertEqual(run.call_args_list[1].args[0], ["sc.exe", "query", "DemoService"])
+        self.assertEqual(run.call_args_list[1].kwargs["timeout"], 0.0)
 
-        def mock_enum(key, index):
-            names = list(mock_keys.keys())
-            if index < len(names):
-                return names[index]
-            raise OSError("no more")
+    @patch("auto_boot.subprocess.run")
+    def test_service_start_fails_when_service_is_not_running(self, run: Mock):
+        run.side_effect = [
+            Mock(returncode=0, stdout="[SC] StartService SUCCESS", stderr=""),
+            Mock(
+                returncode=0,
+                stdout="SERVICE_NAME: DemoService\n        STATE              : 1  STOPPED",
+                stderr="",
+            ),
+        ]
+        logger = auto_boot.logging.getLogger("test-service-stopped")
+        logger.addHandler(auto_boot.logging.NullHandler())
 
-        def mock_query(key, val_name):
-            if val_name == "ImagePath":
-                return mock_keys[key.name]
-            raise OSError("not found")
+        self.assertFalse(auto_boot.start_windows_service("DemoService", logger, timeout=0))
 
-        with patch("winreg.OpenKey", side_effect=lambda root, name: MockKey(name)), \
-             patch("winreg.EnumKey", side_effect=mock_enum), \
-             patch("winreg.QueryValueEx", side_effect=mock_query):
-            services = auto_boot.find_related_services(Path(r"C:\Program Files\Vendor\App\App.exe"))
-            self.assertEqual(services, ["AppService"])
+    def test_first_program_selection_preserves_saved_service_name(self):
+        path = r"D:\uu\GameViewer\GameViewer.exe"
+        app = object.__new__(auto_boot.BootRunnerApp)
+        app.selected_program_path = None
+        app.service_names = {path: "GameViewerService"}
+        app.service_name = Mock()
+        app.program_list = Mock()
+        app.program_list.curselection.return_value = (0,)
+        app.program_list.get.return_value = path
+
+        auto_boot.BootRunnerApp._on_program_selected(app)
+
+        self.assertEqual(app.service_names[path], "GameViewerService")
+        self.assertEqual(app.selected_program_path, path)
+        app.service_name.set.assert_called_once_with("GameViewerService")
 
 
 if __name__ == "__main__":
